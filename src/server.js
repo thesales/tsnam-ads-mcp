@@ -201,8 +201,8 @@ if (AUTH_MODE === "path") {
   });
 }
 
-app.listen(PORT, "0.0.0.1", () => {
+app.listen(PORT, "0.0.0.0", () => {
   // Bind to localhost; terminate TLS and expose publicly via your reverse proxy.
-  console.error(`[tsnam-mcp] listening on http://0.0.0.1:${PORT}  (auth mode: ${AUTH_MODE})`);
+  console.error(`[tsnam-mcp] listening on http://0.0.0.0:${PORT}  (auth mode: ${AUTH_MODE})`);
   console.error(`[tsnam-mcp] upstream: ${API_BASE || "(unset)"}`);
 });
