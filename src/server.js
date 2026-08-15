@@ -2,12 +2,17 @@
 // TSN Ads Manager — MCP Server
 // =============================================================================
 // Exposes your live Google Ads data (via the TSN Ads Manager WordPress plugin's
-// read-only REST API) as MCP tools that Claude can call in conversation.
+// REST API) as MCP tools that Claude can call in conversation.
 //
 //   Claude  ->  this server  ->  TSN Ads Manager REST  ->  Google Ads
 //
 // Transport: Streamable HTTP (the current standard; SSE is deprecated).
 // No build step — plain ESM JavaScript. `npm install` then `node src/server.js`.
+//
+// v110 — adds WRITE tools (negatives, campaign bid/budget, keywords) plus the
+// optimizer trigger. Every write tool is dry-run by default. The real safety
+// caps live in the WordPress plugin, not here: this server is not a trusted
+// component and nothing it sends can exceed the plugin's limits.
 //
 // Configuration (via environment / .env — see .env.example):
 //   TSNAM_API_BASE   e.g. https://tsncommunications.ai/wp-json/tsnam/v1
@@ -37,21 +42,27 @@ if (!MCP_SECRET) console.error("[tsnam-mcp] WARNING: MCP_SECRET is not set — t
 
 // ---- Helper: call the WordPress REST API -----------------------------------
 
-async function wpGet(path, params = {}) {
+async function wpRequest(method, path, { params = {}, body = null } = {}) {
   const url = new URL(API_BASE + path);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
   }
 
+  const init = {
+    method,
+    headers: {
+      "Authorization": "Bearer " + API_TOKEN,
+      "Accept": "application/json",
+    },
+  };
+  if (body !== null) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+
   let resp;
   try {
-    resp = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Authorization": "Bearer " + API_TOKEN,
-        "Accept": "application/json",
-      },
-    });
+    resp = await fetch(url, init);
   } catch (e) {
     return { ok: false, error: `Could not reach TSN Ads Manager at ${url.origin}: ${e.message}` };
   }
@@ -62,23 +73,36 @@ async function wpGet(path, params = {}) {
   catch { return { ok: false, error: `Non-JSON response (HTTP ${resp.status}): ${text.slice(0, 300)}` }; }
 
   if (!resp.ok || data.ok === false) {
-    return { ok: false, error: data.error || `HTTP ${resp.status} from TSN Ads Manager`, status: resp.status };
+    return { ok: false, error: data.error || `HTTP ${resp.status} from TSN Ads Manager`, status: resp.status, ...data };
   }
   return data;
 }
+
+const wpGet  = (path, params = {})    => wpRequest("GET",  path, { params });
+const wpPost = (path, body = {})      => wpRequest("POST", path, { body });
 
 // Wrap any tool result as MCP text content (pretty JSON the model can read).
 function result(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
 
+// Shared wording so every write tool teaches the same two-step habit.
+const DRY_RUN_DESC =
+  "Leave this true (the default) to preview. A dry run returns exactly what WOULD change and " +
+  "touches nothing. Only set false after showing the user the dry-run plan and getting their " +
+  "explicit go-ahead in that same conversation. Never set false on the first call for a change.";
+
 // ---- Build the MCP server with its tools -----------------------------------
 
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.0.0",
+    version: "1.1.0",
   });
+
+  // =========================================================================
+  // READ TOOLS
+  // =========================================================================
 
   server.registerTool(
     "get_health",
@@ -152,6 +176,103 @@ function buildServer() {
       },
     },
     async ({ query }) => result(await wpGet("/gaql", { q: query }))
+  );
+
+  // =========================================================================
+  // WRITE TOOLS — dry-run by default
+  // =========================================================================
+
+  server.registerTool(
+    "add_negative_keywords",
+    {
+      title: "Add negative keywords",
+      description:
+        "Add campaign-level negative keywords to a Google Ads campaign. This is the main tool for cutting " +
+        "wasted spend found via get_search_terms — competitor brand names, job seekers, DIY researchers. " +
+        "Terms already present on the campaign are detected and skipped, so overlap is safe. " +
+        "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false. " +
+        "Reversible: a wrong negative can be deleted in the Google Ads UI.",
+      inputSchema: {
+        campaign_id: z.string().min(1)
+          .describe("Numeric Google Ads campaign ID. Get it from list_campaigns."),
+        keywords: z.array(z.string().min(1)).min(1).max(100)
+          .describe("Negative keyword terms, without brackets or quotes. Max 100 per call."),
+        match_type: z.enum(["BROAD", "PHRASE", "EXACT"]).default("BROAD")
+          .describe("BROAD (default) blocks any query containing the term — right for competitor brands and junk topics. PHRASE and EXACT are narrower."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ campaign_id, keywords, match_type, dry_run }) =>
+      result(await wpPost("/mutate/negatives", { campaign_id, keywords, match_type, dry_run }))
+  );
+
+  server.registerTool(
+    "set_campaign_bid",
+    {
+      title: "Set campaign CPC ceiling / daily budget",
+      description:
+        "Change a campaign's max CPC bid ceiling and/or its daily budget. Both are in dollars. " +
+        "cpc_ceiling only applies to Maximize Clicks (TARGET_SPEND) campaigns — the call is refused with a " +
+        "clear message on other bidding strategies. The plugin enforces hard caps ($6.00 ceiling, $50.00/day " +
+        "budget) and will reject anything above them. " +
+        "ALWAYS run once with dry_run true and get explicit confirmation before setting dry_run false — " +
+        "this tool directly changes how fast money leaves the account.",
+      inputSchema: {
+        campaign_id: z.string().min(1)
+          .describe("Numeric Google Ads campaign ID. Get it from list_campaigns."),
+        cpc_ceiling: z.number().positive().optional()
+          .describe("New max CPC bid ceiling in dollars, e.g. 2.50. Omit to leave unchanged."),
+        daily_budget: z.number().positive().optional()
+          .describe("New daily budget in dollars, e.g. 10.00. Omit to leave unchanged."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ campaign_id, cpc_ceiling, daily_budget, dry_run }) =>
+      result(await wpPost("/mutate/campaign-bid", { campaign_id, cpc_ceiling, daily_budget, dry_run }))
+  );
+
+  server.registerTool(
+    "manage_keywords",
+    {
+      title: "Add or pause keywords",
+      description:
+        "Add keywords to an ad group, or pause existing ones by their text. Use action 'add' or 'pause'. " +
+        "For 'add', keywords already present at that match type are skipped. For 'pause', keywords are matched " +
+        "by text and any already-paused ones are left alone. " +
+        "Get ad_group_id via run_gaql: SELECT ad_group.id, ad_group.name FROM ad_group WHERE campaign.id = <id>. " +
+        "ALWAYS dry_run first and confirm with the user before committing. Adding keywords opens new spend; " +
+        "check search volume before assuming a keyword will actually serve.",
+      inputSchema: {
+        ad_group_id: z.string().min(1)
+          .describe("Numeric Google Ads ad group ID."),
+        keywords: z.array(z.string().min(1)).min(1).max(50)
+          .describe("Keyword texts, without brackets or quotes. Max 50 per call."),
+        action: z.enum(["add", "pause"]).default("add")
+          .describe("'add' creates new enabled keywords. 'pause' pauses existing ones matched by text."),
+        match_type: z.enum(["BROAD", "PHRASE", "EXACT"]).default("PHRASE")
+          .describe("Match type for 'add' (default PHRASE), and the match type recorded in the plan."),
+        cpc_bid: z.number().positive().optional()
+          .describe("Optional per-keyword max CPC in dollars. Omit to inherit the ad group bid. Capped at $6.00 by the plugin."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ ad_group_id, keywords, action, match_type, cpc_bid, dry_run }) =>
+      result(await wpPost("/mutate/keywords", { ad_group_id, keywords, action, match_type, cpc_bid, dry_run }))
+  );
+
+  server.registerTool(
+    "run_optimizer",
+    {
+      title: "Run the optimizer",
+      description:
+        "Trigger one optimizer mining pass. It scans recent search terms, scores them for relevance against " +
+        "the configured campaign offers, and queues negative-keyword proposals for review. Safe to call: it " +
+        "does not mutate the account unless auto-apply has been switched on in the plugin settings. " +
+        "Returns a summary of what was scanned, flagged, and queued. Review the resulting proposals on the " +
+        "Optimizer tab in WordPress, or act on them with add_negative_keywords.",
+      inputSchema: {},
+    },
+    async () => result(await wpPost("/optimizer/run", {}))
   );
 
   return server;
