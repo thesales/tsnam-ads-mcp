@@ -14,6 +14,15 @@
 // caps live in the WordPress plugin, not here: this server is not a trusted
 // component and nothing it sends can exceed the plugin's limits.
 //
+// v114 — adds create_ad_group, matching the plugin's new /mutate/ad-group route.
+// Also corrects the cap wording in two tool descriptions: as of plugin v114 the
+// per-campaign CPC and budget limits are EDITABLE SETTINGS rather than hardcoded
+// constants, and there is a new account-wide daily ceiling on top of them. A
+// description that names a fixed dollar figure would be quietly wrong the moment
+// Greg changes one, so the descriptions now say the limits exist without
+// asserting their values — the plugin is the authority and reports the real
+// number in any refusal.
+//
 // Configuration (via environment / .env — see .env.example):
 //   TSNAM_API_BASE   e.g. https://tsncommunications.ai/wp-json/tsnam/v1
 //   TSNAM_API_TOKEN  the Bearer token shown on the TSN Ads Manager admin page
@@ -92,12 +101,22 @@ const DRY_RUN_DESC =
   "touches nothing. Only set false after showing the user the dry-run plan and getting their " +
   "explicit go-ahead in that same conversation. Never set false on the first call for a change.";
 
+// Spend limits are configured in WordPress and may be tightened at any time, so
+// no tool description states a figure. The plugin refuses anything over a limit
+// and names the actual number in the error, which is the only version that
+// cannot go stale.
+const CAPS_DESC =
+  "The plugin enforces its own spend limits — a per-campaign CPC ceiling, a per-campaign daily " +
+  "budget, and an account-wide daily total across all enabled campaigns — and rejects anything " +
+  "above them, naming the limit in the error. Those limits are editable in WordPress, so do not " +
+  "assume a particular figure; if a call is refused on a cap, report the plugin's message verbatim.";
+
 // ---- Build the MCP server with its tools -----------------------------------
 
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   // =========================================================================
@@ -213,8 +232,9 @@ function buildServer() {
       description:
         "Change a campaign's max CPC bid ceiling and/or its daily budget. Both are in dollars. " +
         "cpc_ceiling only applies to Maximize Clicks (TARGET_SPEND) campaigns — the call is refused with a " +
-        "clear message on other bidding strategies. The plugin enforces hard caps ($6.00 ceiling, $50.00/day " +
-        "budget) and will reject anything above them. " +
+        "clear message on other bidding strategies. " + CAPS_DESC + " " +
+        "A budget INCREASE is also checked against the account-wide ceiling and refused if the new total " +
+        "would breach it; reductions are always allowed. " +
         "ALWAYS run once with dry_run true and get explicit confirmation before setting dry_run false — " +
         "this tool directly changes how fast money leaves the account.",
       inputSchema: {
@@ -239,7 +259,7 @@ function buildServer() {
         "Add keywords to an ad group, or pause existing ones by their text. Use action 'add' or 'pause'. " +
         "For 'add', keywords already present at that match type are skipped. For 'pause', keywords are matched " +
         "by text and any already-paused ones are left alone. " +
-        "Get ad_group_id via run_gaql: SELECT ad_group.id, ad_group.name FROM ad_group WHERE campaign.id = <id>. " +
+        "Get ad_group_id via list_ad_groups, or via run_gaql: SELECT ad_group.id, ad_group.name FROM ad_group WHERE campaign.id = <id>. " +
         "ALWAYS dry_run first and confirm with the user before committing. Adding keywords opens new spend; " +
         "check search volume before assuming a keyword will actually serve.",
       inputSchema: {
@@ -252,12 +272,68 @@ function buildServer() {
         match_type: z.enum(["BROAD", "PHRASE", "EXACT"]).default("PHRASE")
           .describe("Match type for 'add' (default PHRASE), and the match type recorded in the plan."),
         cpc_bid: z.number().positive().optional()
-          .describe("Optional per-keyword max CPC in dollars. Omit to inherit the ad group bid. Capped at $6.00 by the plugin."),
+          .describe("Optional per-keyword max CPC in dollars. Omit to inherit the ad group bid. The plugin caps this at its configured CPC ceiling and reports the limit if exceeded."),
         dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
       },
     },
     async ({ ad_group_id, keywords, action, match_type, cpc_bid, dry_run }) =>
       result(await wpPost("/mutate/keywords", { ad_group_id, keywords, action, match_type, cpc_bid, dry_run }))
+  );
+
+  server.registerTool(
+    "list_ad_groups",
+    {
+      title: "List ad groups in a campaign",
+      description:
+        "List the ad groups in a campaign with their IDs, names, status and default CPC bid. " +
+        "Use this to get an ad_group_id for manage_keywords, or to check what already exists before " +
+        "proposing a new ad group.",
+      inputSchema: {
+        campaign_id: z.string().min(1)
+          .describe("Numeric Google Ads campaign ID. Get it from list_campaigns."),
+      },
+    },
+    async ({ campaign_id }) =>
+      result(await wpGet("/gaql", {
+        q: `SELECT ad_group.id, ad_group.name, ad_group.status, ad_group.cpc_bid_micros ` +
+           `FROM ad_group WHERE campaign.id = ${String(campaign_id).replace(/[^0-9]/g, "")} ` +
+           `AND ad_group.status != 'REMOVED'`,
+      }))
+  );
+
+  server.registerTool(
+    "create_ad_group",
+    {
+      title: "Create an ad group",
+      description:
+        "Create a new ad group inside an EXISTING campaign, add its keywords, and clone a Google-approved " +
+        "ad into it so it actually serves. Use this when a distinct intent cluster is being forced through " +
+        "an ad group that does not match it. " +
+        "IMPORTANT — the ad copy is CLONED from an already-approved ad elsewhere in the same campaign. That " +
+        "is what makes this safe to automate: no new ad text means no new policy exposure, and the ad group " +
+        "starts serving immediately. But cloned copy by definition does not speak to the new intent, so tell " +
+        "the user that writing proper copy is a required follow-up, not an optional polish. " +
+        "If the campaign has no approved ad to clone, the call is refused rather than leaving behind an ad " +
+        "group that can never serve — build that one in the plugin's pusher instead, where the copy is reviewed. " +
+        "This tool does NOT create campaigns. Campaign creation needs new ad copy, a landing page and a geo, " +
+        "and it belongs in the pusher UI. " + CAPS_DESC + " " +
+        "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false.",
+      inputSchema: {
+        campaign_id: z.string().min(1)
+          .describe("Numeric Google Ads campaign ID of the EXISTING campaign to add the ad group to. Get it from list_campaigns."),
+        name: z.string().min(1)
+          .describe("Name for the new ad group. If the name is already taken in that campaign, the plugin appends a date suffix rather than failing."),
+        keywords: z.array(z.string().min(1)).min(1).max(50)
+          .describe("Keyword texts for the new ad group, without brackets or quotes. Max 50. An ad group with no keywords cannot serve, so at least one is required."),
+        match_type: z.enum(["BROAD", "PHRASE", "EXACT"]).default("PHRASE")
+          .describe("Match type for the new keywords. PHRASE is the working default for this account; BROAD pulls unrelated intent faster than negatives can catch it at small budgets."),
+        cpc_bid: z.number().positive().optional()
+          .describe("Optional default max CPC for the ad group, in dollars. Omit for the plugin default of $1.00. Subject to the configured CPC cap."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ campaign_id, name, keywords, match_type, cpc_bid, dry_run }) =>
+      result(await wpPost("/mutate/ad-group", { campaign_id, name, keywords, match_type, cpc_bid, dry_run }))
   );
 
   server.registerTool(
