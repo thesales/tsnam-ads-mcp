@@ -23,6 +23,12 @@
 // asserting their values — the plugin is the authority and reports the real
 // number in any refusal.
 //
+// v115.5 / server 1.3.0 — adds get_digest_last_run, reading the plugin's new
+// /digest/last-run route. The daily digest records how its analysis call went on
+// every run, and that record includes the raw model response when a run failed.
+// Before this tool the only way to read a failed run was to open the WordPress
+// admin screen and paste it into a chat by hand.
+//
 // Configuration (via environment / .env — see .env.example):
 //   TSNAM_API_BASE   e.g. https://tsncommunications.ai/wp-json/tsnam/v1
 //   TSNAM_API_TOKEN  the Bearer token shown on the TSN Ads Manager admin page
@@ -116,7 +122,7 @@ const CAPS_DESC =
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.2.0",
+    version: "1.3.0",
   });
 
   // =========================================================================
@@ -182,6 +188,25 @@ function buildServer() {
       },
     },
     async ({ days, limit }) => result(await wpGet("/search-terms", { days, limit }))
+  );
+
+  server.registerTool(
+    "get_digest_last_run",
+    {
+      title: "Last daily digest run",
+      description:
+        "Read how the most recent 8am daily digest analysis went: when it ran, whether it " +
+        "parsed cleanly (ok), recovered only part of itself (salvaged), or failed, plus the " +
+        "model, stop reason, decoder error, character count, and number of findings. When a " +
+        "run did NOT parse cleanly, the raw model response is included so the cause can be " +
+        "read rather than guessed at. Use this whenever the digest email reports a problem, " +
+        "or to confirm a digest ran at all. Read-only. schema_enforced tells you whether the " +
+        "call was constrained to the findings schema; false means the API refused the schema " +
+        "and the run fell back to parsing free text, which is worth knowing before diagnosing " +
+        "a parse failure.",
+      inputSchema: {},
+    },
+    async () => result(await wpGet("/digest/last-run"))
   );
 
   server.registerTool(
