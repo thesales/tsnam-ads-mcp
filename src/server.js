@@ -29,6 +29,13 @@
 // Before this tool the only way to read a failed run was to open the WordPress
 // admin screen and paste it into a chat by hand.
 //
+// v115.7 / server 1.4.0 — adds create_rsa and set_ad_status, matching the
+// plugin's new /mutate/rsa and /mutate/ad-status routes. Together they let
+// Claude finish a copy change end to end: write the ad (always PAUSED), then
+// enable it and pause the one it replaces, each as its own dry-run-first call.
+// Campaign status is still not reachable — these act on single ads inside
+// campaigns that are already running, so they cannot turn spend on.
+//
 // Configuration (via environment / .env — see .env.example):
 //   TSNAM_API_BASE   e.g. https://tsncommunications.ai/wp-json/tsnam/v1
 //   TSNAM_API_TOKEN  the Bearer token shown on the TSN Ads Manager admin page
@@ -122,7 +129,7 @@ const CAPS_DESC =
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.3.0",
+    version: "1.4.0",
   });
 
   // =========================================================================
@@ -359,6 +366,63 @@ function buildServer() {
     },
     async ({ campaign_id, name, keywords, match_type, cpc_bid, dry_run }) =>
       result(await wpPost("/mutate/ad-group", { campaign_id, name, keywords, match_type, cpc_bid, dry_run }))
+  );
+
+  server.registerTool(
+    "create_rsa",
+    {
+      title: "Create a responsive search ad (paused)",
+      description:
+        "Create a new responsive search ad from copy the user has already read, inside an existing ad group. " +
+        "The ad is ALWAYS created PAUSED — there is no option to create it enabled. Enabling is a separate " +
+        "set_ad_status call, so writing copy and running copy stay two decisions. " +
+        "Pass campaign_id to add it beside that campaign's live ad, or ad_group_id to target an ad group directly. " +
+        "The final URL defaults to the live ad's URL, and the plugin always forces ?kw={keyword} onto it so the " +
+        "landing page can echo the search term. Limits are enforced in the plugin: headlines 30 characters (3 to 15), " +
+        "descriptions 90 characters (2 to 4), display paths 15 characters. An over-long line is REFUSED and named, " +
+        "never truncated — fix it and resend. Show the user every headline and description before the live call. " +
+        "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false.",
+      inputSchema: {
+        campaign_id: z.string().optional()
+          .describe("Numeric campaign ID. The ad goes into the ad group holding that campaign's live approved ad."),
+        ad_group_id: z.string().optional()
+          .describe("Numeric ad group ID, to target a specific ad group. Takes precedence over campaign_id."),
+        headlines: z.array(z.string().min(1)).min(3).max(15)
+          .describe("3 to 15 headlines, 30 characters or fewer each. Unique. No third-party brand names."),
+        descriptions: z.array(z.string().min(1)).min(2).max(4)
+          .describe("2 to 4 descriptions, 90 characters or fewer each."),
+        final_url: z.string().optional()
+          .describe("Optional. Omit to reuse the live ad's landing page. ?kw={keyword} is added either way."),
+        path1: z.string().max(15).optional().describe("Optional display path, 15 characters max."),
+        path2: z.string().max(15).optional().describe("Optional second display path, 15 characters max."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ campaign_id, ad_group_id, headlines, descriptions, final_url, path1, path2, dry_run }) =>
+      result(await wpPost("/mutate/rsa", { campaign_id, ad_group_id, headlines, descriptions, final_url, path1, path2, dry_run }))
+  );
+
+  server.registerTool(
+    "set_ad_status",
+    {
+      title: "Enable or pause one ad",
+      description:
+        "Enable or pause a single ad by ad_group_id and ad_id. Use it to switch a reviewed paused ad on, and to " +
+        "pause the ad it replaces. The dry run reports the ad's current status and Google's policy review, and " +
+        "warns if the ad is disapproved or its campaign is not running — read those before the live call. " +
+        "This never changes campaign status; a paused campaign stays paused. " +
+        "Get ad IDs from run_gaql, e.g. SELECT ad_group.id, ad_group_ad.ad.id, ad_group_ad.status FROM ad_group_ad " +
+        "WHERE campaign.id = <id>. " +
+        "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false.",
+      inputSchema: {
+        ad_group_id: z.string().min(1).describe("Numeric ad group ID."),
+        ad_id: z.string().min(1).describe("Numeric ad ID (the part after ~ in an adGroupAds resource name)."),
+        status: z.enum(["ENABLED", "PAUSED"]).describe("ENABLED to run the ad, PAUSED to stop it. REMOVED is deliberately not offered."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ ad_group_id, ad_id, status, dry_run }) =>
+      result(await wpPost("/mutate/ad-status", { ad_group_id, ad_id, status, dry_run }))
   );
 
   server.registerTool(
