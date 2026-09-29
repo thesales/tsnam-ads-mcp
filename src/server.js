@@ -36,6 +36,14 @@
 // Campaign status is still not reachable — these act on single ads inside
 // campaigns that are already running, so they cannot turn spend on.
 //
+// server 1.5.0 (plugin v115.9.2+): adds get_platform_performance (Google,
+// Microsoft and ChatGPT in one call, each with a status), list_recent_changes
+// and undo_change, reading the plugin's /performance/platforms,
+// /proposals/recent and /proposals/{id}/undo routes. undo_change keeps the
+// dry-run-first habit: the dry run is answered here from /proposals/recent and
+// touches nothing; only the live call reaches the plugin, which applies the
+// kill switch and every spend cap to the way back.
+//
 // Configuration (via environment / .env — see .env.example):
 //   TSNAM_API_BASE   e.g. https://tsncommunications.ai/wp-json/tsnam/v1
 //   TSNAM_API_TOKEN  the Bearer token shown on the TSN Ads Manager admin page
@@ -129,7 +137,7 @@ const CAPS_DESC =
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.4.0",
+    version: "1.5.0",
   });
 
   // =========================================================================
@@ -423,6 +431,79 @@ function buildServer() {
     },
     async ({ ad_group_id, ad_id, status, dry_run }) =>
       result(await wpPost("/mutate/ad-status", { ad_group_id, ad_id, status, dry_run }))
+  );
+
+  server.registerTool(
+    "get_platform_performance",
+    {
+      title: "All ad platforms",
+      description:
+        "Get KPI data for Google Ads, Microsoft Ads and ChatGPT (OpenAI) Ads in one call, the same numbers the " +
+        "Ads Manager dashboard shows. Each platform comes back with its own status: ok, not_configured, or " +
+        "error with the reason. Report a platform that is not ok by its status and message; never treat a " +
+        "missing platform as zero spend.",
+      inputSchema: {
+        days: z.union([z.literal(7), z.literal(30), z.literal(90)]).default(7)
+          .describe("Window in days: 7, 30 or 90. Default 7."),
+      },
+    },
+    async ({ days }) => result(await wpGet("/performance/platforms", { days }))
+  );
+
+  server.registerTool(
+    "list_recent_changes",
+    {
+      title: "Recent changes",
+      description:
+        "List recent decisions on digest and optimizer proposals: what was applied, undone or rejected, by whom " +
+        "and when. Each applied change says whether it can be undone (can_undo) and what the undo would do " +
+        "(undo_label). Use this to find the id for undo_change. Changes applied before plugin v115.9 have no " +
+        "recorded undo.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(50).default(20)
+          .describe("How many recent decisions to return (1-50). Default 20."),
+      },
+    },
+    async ({ limit }) => result(await wpGet("/proposals/recent", { limit }))
+  );
+
+  server.registerTool(
+    "undo_change",
+    {
+      title: "Undo one applied change",
+      description:
+        "Reverse one change that was applied from the digest review page or the Optimizer tab, using the before " +
+        "state the plugin recorded at the moment it applied it (restore a budget or CPC ceiling, re-enable " +
+        "paused keywords, pause added keywords, remove an added negative, put a campaign setting back, pause a " +
+        "new ad group). The dry run looks the change up and reports what the undo would do, touching nothing. " +
+        "The live call goes through the plugin's kill switch, and restoring a HIGHER budget or ceiling goes " +
+        "through the same spend limits as any change, so it can be refused. " + CAPS_DESC + " " +
+        "Get the id from list_recent_changes. " +
+        "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false.",
+      inputSchema: {
+        id: z.number().int().min(1).describe("Proposal id from list_recent_changes."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ id, dry_run }) => {
+      if (!dry_run) return result(await wpPost(`/proposals/${id}/undo`, {}));
+      const recent = await wpGet("/proposals/recent", { limit: 50 });
+      if (recent.ok === false) return result(recent);
+      const row = (recent.proposals || []).find(p => Number(p.id) === Number(id));
+      if (!row) {
+        return result({ ok: false, dry_run: true, id,
+          error: "Not among the 50 most recent decisions. Check the id with list_recent_changes." });
+      }
+      return result({
+        ok: row.can_undo, dry_run: true, id, change: row.label, type: row.type, status: row.status,
+        would_do: row.can_undo ? row.undo_label : null,
+        note: row.can_undo
+          ? "Nothing has been changed. Re-run with dry_run false to undo."
+          : (row.status !== "applied"
+              ? `This change is ${row.status}, so there is nothing to undo.`
+              : "No undo was recorded for this change (applied before plugin v115.9, or not reversible here). Reverse it in Google Ads."),
+      });
+    }
   );
 
   server.registerTool(
