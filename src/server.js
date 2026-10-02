@@ -1,5 +1,5 @@
 // =============================================================================
-// TSN Ads Manager — MCP Server
+// TSN Ads Manager, MCP Server
 // =============================================================================
 // Exposes your live Google Ads data (via the TSN Ads Manager WordPress plugin's
 // REST API) as MCP tools that Claude can call in conversation.
@@ -7,33 +7,33 @@
 //   Claude  ->  this server  ->  TSN Ads Manager REST  ->  Google Ads
 //
 // Transport: Streamable HTTP (the current standard; SSE is deprecated).
-// No build step — plain ESM JavaScript. `npm install` then `node src/server.js`.
+// No build step, plain ESM JavaScript. `npm install` then `node src/server.js`.
 //
-// v110 — adds WRITE tools (negatives, campaign bid/budget, keywords) plus the
+// v110, adds WRITE tools (negatives, campaign bid/budget, keywords) plus the
 // optimizer trigger. Every write tool is dry-run by default. The real safety
 // caps live in the WordPress plugin, not here: this server is not a trusted
 // component and nothing it sends can exceed the plugin's limits.
 //
-// v114 — adds create_ad_group, matching the plugin's new /mutate/ad-group route.
+// v114, adds create_ad_group, matching the plugin's new /mutate/ad-group route.
 // Also corrects the cap wording in two tool descriptions: as of plugin v114 the
 // per-campaign CPC and budget limits are EDITABLE SETTINGS rather than hardcoded
 // constants, and there is a new account-wide daily ceiling on top of them. A
 // description that names a fixed dollar figure would be quietly wrong the moment
 // Greg changes one, so the descriptions now say the limits exist without
-// asserting their values — the plugin is the authority and reports the real
+// asserting their values, the plugin is the authority and reports the real
 // number in any refusal.
 //
-// v115.5 / server 1.3.0 — adds get_digest_last_run, reading the plugin's new
+// v115.5 / server 1.3.0, adds get_digest_last_run, reading the plugin's new
 // /digest/last-run route. The daily digest records how its analysis call went on
 // every run, and that record includes the raw model response when a run failed.
 // Before this tool the only way to read a failed run was to open the WordPress
 // admin screen and paste it into a chat by hand.
 //
-// v115.7 / server 1.4.0 — adds create_rsa and set_ad_status, matching the
+// v115.7 / server 1.4.0, adds create_rsa and set_ad_status, matching the
 // plugin's new /mutate/rsa and /mutate/ad-status routes. Together they let
 // Claude finish a copy change end to end: write the ad (always PAUSED), then
 // enable it and pause the one it replaces, each as its own dry-run-first call.
-// Campaign status is still not reachable — these act on single ads inside
+// Campaign status is still not reachable, these act on single ads inside
 // campaigns that are already running, so they cannot turn spend on.
 //
 // server 1.5.0 (plugin v115.9.2+): adds get_platform_performance (Google,
@@ -44,7 +44,14 @@
 // touches nothing; only the live call reaches the plugin, which applies the
 // kill switch and every spend cap to the way back.
 //
-// Configuration (via environment / .env — see .env.example):
+// server 1.6.0 (plugin v115.9.4+): adds update_conversion_goal, reading the
+// plugin's /mutate/conversion-goal route. It sets one campaign conversion goal
+// biddable or not biddable. Dry run first, as always: the dry run names every
+// primary conversion action that will start counting. A live change is
+// recorded as an applied change, so list_recent_changes shows it and
+// undo_change reverses it.
+//
+// Configuration (via environment / .env, see .env.example):
 //   TSNAM_API_BASE   e.g. https://tsncommunications.ai/wp-json/tsnam/v1
 //   TSNAM_API_TOKEN  the Bearer token shown on the TSN Ads Manager admin page
 //   MCP_SECRET       a secret that protects THIS server's endpoint
@@ -68,7 +75,7 @@ const PORT       = parseInt(process.env.PORT || "8787", 10);
 
 if (!API_BASE)  console.error("[tsnam-mcp] WARNING: TSNAM_API_BASE is not set.");
 if (!API_TOKEN) console.error("[tsnam-mcp] WARNING: TSNAM_API_TOKEN is not set.");
-if (!MCP_SECRET) console.error("[tsnam-mcp] WARNING: MCP_SECRET is not set — the endpoint is UNPROTECTED.");
+if (!MCP_SECRET) console.error("[tsnam-mcp] WARNING: MCP_SECRET is not set, the endpoint is UNPROTECTED.");
 
 // ---- Helper: call the WordPress REST API -----------------------------------
 
@@ -127,8 +134,8 @@ const DRY_RUN_DESC =
 // and names the actual number in the error, which is the only version that
 // cannot go stale.
 const CAPS_DESC =
-  "The plugin enforces its own spend limits — a per-campaign CPC ceiling, a per-campaign daily " +
-  "budget, and an account-wide daily total across all enabled campaigns — and rejects anything " +
+  "The plugin enforces its own spend limits, a per-campaign CPC ceiling, a per-campaign daily " +
+  "budget, and an account-wide daily total across all enabled campaigns, and rejects anything " +
   "above them, naming the limit in the error. Those limits are editable in WordPress, so do not " +
   "assume a particular figure; if a call is refused on a cap, report the plugin's message verbatim.";
 
@@ -137,7 +144,7 @@ const CAPS_DESC =
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.5.0",
+    version: "1.6.0",
   });
 
   // =========================================================================
@@ -158,7 +165,7 @@ function buildServer() {
     "list_campaigns",
     {
       title: "List campaigns",
-      description: "List all Google Ads campaigns (excluding removed ones) with their status and daily budget. Use this to see what campaigns exist and get their IDs. No date range — this is the full roster regardless of recent activity.",
+      description: "List all Google Ads campaigns (excluding removed ones) with their status and daily budget. Use this to see what campaigns exist and get their IDs. No date range, this is the full roster regardless of recent activity.",
       inputSchema: {},
     },
     async () => result(await wpGet("/campaigns"))
@@ -231,14 +238,14 @@ function buildServer() {
       description: "Run a raw read-only Google Ads Query Language (GAQL) SELECT query against the connected account and return the raw results. Use this for custom reports the other tools don't cover. Only SELECT queries are permitted. Example: SELECT campaign.name, metrics.clicks FROM campaign WHERE segments.date DURING LAST_7_DAYS",
       inputSchema: {
         query: z.string().min(1)
-          .describe("A GAQL SELECT query. Must begin with SELECT. Read-only — cannot modify the account."),
+          .describe("A GAQL SELECT query. Must begin with SELECT. Read-only, cannot modify the account."),
       },
     },
     async ({ query }) => result(await wpGet("/gaql", { q: query }))
   );
 
   // =========================================================================
-  // WRITE TOOLS — dry-run by default
+  // WRITE TOOLS, dry-run by default
   // =========================================================================
 
   server.registerTool(
@@ -247,7 +254,7 @@ function buildServer() {
       title: "Add negative keywords",
       description:
         "Add campaign-level negative keywords to a Google Ads campaign. This is the main tool for cutting " +
-        "wasted spend found via get_search_terms — competitor brand names, job seekers, DIY researchers. " +
+        "wasted spend found via get_search_terms, competitor brand names, job seekers, DIY researchers. " +
         "Terms already present on the campaign are detected and skipped, so overlap is safe. " +
         "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false. " +
         "Reversible: a wrong negative can be deleted in the Google Ads UI.",
@@ -257,7 +264,7 @@ function buildServer() {
         keywords: z.array(z.string().min(1)).min(1).max(100)
           .describe("Negative keyword terms, without brackets or quotes. Max 100 per call."),
         match_type: z.enum(["BROAD", "PHRASE", "EXACT"]).default("BROAD")
-          .describe("BROAD (default) blocks any query containing the term — right for competitor brands and junk topics. PHRASE and EXACT are narrower."),
+          .describe("BROAD (default) blocks any query containing the term, right for competitor brands and junk topics. PHRASE and EXACT are narrower."),
         dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
       },
     },
@@ -271,11 +278,11 @@ function buildServer() {
       title: "Set campaign CPC ceiling / daily budget",
       description:
         "Change a campaign's max CPC bid ceiling and/or its daily budget. Both are in dollars. " +
-        "cpc_ceiling only applies to Maximize Clicks (TARGET_SPEND) campaigns — the call is refused with a " +
+        "cpc_ceiling only applies to Maximize Clicks (TARGET_SPEND) campaigns, the call is refused with a " +
         "clear message on other bidding strategies. " + CAPS_DESC + " " +
         "A budget INCREASE is also checked against the account-wide ceiling and refused if the new total " +
         "would breach it; reductions are always allowed. " +
-        "ALWAYS run once with dry_run true and get explicit confirmation before setting dry_run false — " +
+        "ALWAYS run once with dry_run true and get explicit confirmation before setting dry_run false, " +
         "this tool directly changes how fast money leaves the account.",
       inputSchema: {
         campaign_id: z.string().min(1)
@@ -349,12 +356,12 @@ function buildServer() {
         "Create a new ad group inside an EXISTING campaign, add its keywords, and clone a Google-approved " +
         "ad into it so it actually serves. Use this when a distinct intent cluster is being forced through " +
         "an ad group that does not match it. " +
-        "IMPORTANT — the ad copy is CLONED from an already-approved ad elsewhere in the same campaign. That " +
+        "IMPORTANT, the ad copy is CLONED from an already-approved ad elsewhere in the same campaign. That " +
         "is what makes this safe to automate: no new ad text means no new policy exposure, and the ad group " +
         "starts serving immediately. But cloned copy by definition does not speak to the new intent, so tell " +
         "the user that writing proper copy is a required follow-up, not an optional polish. " +
         "If the campaign has no approved ad to clone, the call is refused rather than leaving behind an ad " +
-        "group that can never serve — build that one in the plugin's pusher instead, where the copy is reviewed. " +
+        "group that can never serve, build that one in the plugin's pusher instead, where the copy is reviewed. " +
         "This tool does NOT create campaigns. Campaign creation needs new ad copy, a landing page and a geo, " +
         "and it belongs in the pusher UI. " + CAPS_DESC + " " +
         "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false.",
@@ -382,13 +389,13 @@ function buildServer() {
       title: "Create a responsive search ad (paused)",
       description:
         "Create a new responsive search ad from copy the user has already read, inside an existing ad group. " +
-        "The ad is ALWAYS created PAUSED — there is no option to create it enabled. Enabling is a separate " +
+        "The ad is ALWAYS created PAUSED, there is no option to create it enabled. Enabling is a separate " +
         "set_ad_status call, so writing copy and running copy stay two decisions. " +
         "Pass campaign_id to add it beside that campaign's live ad, or ad_group_id to target an ad group directly. " +
         "The final URL defaults to the live ad's URL, and the plugin always forces ?kw={keyword} onto it so the " +
         "landing page can echo the search term. Limits are enforced in the plugin: headlines 30 characters (3 to 15), " +
         "descriptions 90 characters (2 to 4), display paths 15 characters. An over-long line is REFUSED and named, " +
-        "never truncated — fix it and resend. Show the user every headline and description before the live call. " +
+        "never truncated, fix it and resend. Show the user every headline and description before the live call. " +
         "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false.",
       inputSchema: {
         campaign_id: z.string().optional()
@@ -417,7 +424,7 @@ function buildServer() {
       description:
         "Enable or pause a single ad by ad_group_id and ad_id. Use it to switch a reviewed paused ad on, and to " +
         "pause the ad it replaces. The dry run reports the ad's current status and Google's policy review, and " +
-        "warns if the ad is disapproved or its campaign is not running — read those before the live call. " +
+        "warns if the ad is disapproved or its campaign is not running, read those before the live call. " +
         "This never changes campaign status; a paused campaign stays paused. " +
         "Get ad IDs from run_gaql, e.g. SELECT ad_group.id, ad_group_ad.ad.id, ad_group_ad.status FROM ad_group_ad " +
         "WHERE campaign.id = <id>. " +
@@ -431,6 +438,32 @@ function buildServer() {
     },
     async ({ ad_group_id, ad_id, status, dry_run }) =>
       result(await wpPost("/mutate/ad-status", { ad_group_id, ad_id, status, dry_run }))
+  );
+
+  server.registerTool(
+    "update_conversion_goal",
+    {
+      title: "Set a campaign conversion goal biddable",
+      description:
+        "Turn one campaign conversion goal on or off for bidding (the checkbox in the campaign's Goals settings). " +
+        "A goal is a category plus origin, e.g. SUBMIT_LEAD_FORM + WEBSITE. Only biddable goals count in the \"Conversions\" " +
+        "column, so a campaign whose real lead goal is not biddable looks like it never converts. On this account's " +
+        "Maximize Clicks bidding the change does not affect spend. Every PRIMARY conversion action in the category " +
+        "starts or stops counting together; the dry run lists them under would_count. Check that list for an action " +
+        "that duplicates another before going live. Read current goals with run_gaql: SELECT " +
+        "campaign_conversion_goal.category, campaign_conversion_goal.origin, campaign_conversion_goal.biddable FROM " +
+        "campaign_conversion_goal WHERE campaign.id = <id>. A live change returns change_id; undo_change with that id " +
+        "puts it back. ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false.",
+      inputSchema: {
+        campaign_id: z.string().min(1).describe("Numeric campaign ID."),
+        category: z.string().regex(/^[A-Za-z_]+$/).describe("Goal category enum, e.g. SUBMIT_LEAD_FORM, BOOK_APPOINTMENT, CONVERTED_LEAD."),
+        origin: z.string().regex(/^[A-Za-z_]+$/).default("WEBSITE").describe("Goal origin enum. Default WEBSITE."),
+        biddable: z.boolean().describe("true to count this goal for the campaign, false to stop counting it."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ campaign_id, category, origin, biddable, dry_run }) =>
+      result(await wpPost("/mutate/conversion-goal", { campaign_id, category: category.toUpperCase(), origin: origin.toUpperCase(), biddable, dry_run }))
   );
 
   server.registerTool(
@@ -475,7 +508,7 @@ function buildServer() {
         "Reverse one change that was applied from the digest review page or the Optimizer tab, using the before " +
         "state the plugin recorded at the moment it applied it (restore a budget or CPC ceiling, re-enable " +
         "paused keywords, pause added keywords, remove an added negative, put a campaign setting back, pause a " +
-        "new ad group). The dry run looks the change up and reports what the undo would do, touching nothing. " +
+        "new ad group, set a conversion goal back to its earlier biddable state). The dry run looks the change up and reports what the undo would do, touching nothing. " +
         "The live call goes through the plugin's kill switch, and restoring a HIGHER budget or ceiling goes " +
         "through the same spend limits as any change, so it can be refused. " + CAPS_DESC + " " +
         "Get the id from list_recent_changes. " +
@@ -550,7 +583,7 @@ if (AUTH_MODE === "path") {
   // can't send a custom header. The unguessable path is what protects it.
   app.post("/mcp/:secret", async (req, res) => {
     if (!MCP_SECRET || req.params.secret !== MCP_SECRET) {
-      return res.status(404).end(); // 404, not 401 — don't confirm the path exists
+      return res.status(404).end(); // 404, not 401, don't confirm the path exists
     }
     await handleMcp(req, res);
   });
