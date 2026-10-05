@@ -51,6 +51,15 @@
 // recorded as an applied change, so list_recent_changes shows it and
 // undo_change reverses it.
 //
+// server 1.7.0 (plugin v116.1.0+): adds ten tools, reading the plugin's
+// /spyfu/* routes and /competitors/list. Eight are read-only SpyFu lookups
+// (usage, domain overview, organic keywords, keyword stats, competitors, ad
+// history, paid keywords, keyword gap). Two read and save the approved
+// competitor list, a WordPress setting; the save is dry run first. SpyFu bills per row returned, and the
+// guards are the plugin's, not this server's: a per-lookup row limit, the
+// monthly row ceiling on the Competitors screen, and a 30-day cache. Every
+// answer carries a "spend" block with the rows it cost and the rows left.
+//
 // Configuration (via environment / .env, see .env.example):
 //   TSNAM_API_BASE   e.g. https://tsncommunications.ai/wp-json/tsnam/v1
 //   TSNAM_API_TOKEN  the Bearer token shown on the TSN Ads Manager admin page
@@ -139,12 +148,25 @@ const CAPS_DESC =
   "above them, naming the limit in the error. Those limits are editable in WordPress, so do not " +
   "assume a particular figure; if a call is refused on a cap, report the plugin's message verbatim.";
 
+// Shared wording for the SpyFu lookups, so each one states the cost rule once.
+const SPYFU_SPEND_DESC =
+  " SpyFu bills per row returned. The plugin caps every lookup at 100 rows, enforces the monthly row " +
+  "ceiling set on the Competitors screen, and caches each answer for 30 days, so a repeat costs nothing. " +
+  "Every answer includes a spend block: report rows_spent and rows_left to the user when a lookup was not cached. " +
+  "SpyFu figures are estimates that lag by weeks, and small advertisers often return little or nothing.";
+
+const SPYFU_DOMAIN = z.string().min(3)
+  .describe("A root domain such as example.com. A full URL is accepted and reduced to its domain.");
+
+const spyfuLimit = (dflt) => z.number().int().min(1).max(100).default(dflt)
+  .describe(`How many rows to buy. Default ${dflt}, hard maximum 100. Ask for the fewest that answer the question.`);
+
 // ---- Build the MCP server with its tools -----------------------------------
 
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.6.0",
+    version: "1.7.0",
   });
 
   // =========================================================================
@@ -242,6 +264,163 @@ function buildServer() {
       },
     },
     async ({ query }) => result(await wpGet("/gaql", { q: query }))
+  );
+
+  // =========================================================================
+  // SPYFU LOOKUPS (read-only, metered)
+  // =========================================================================
+
+  server.registerTool(
+    "spyfu_usage",
+    {
+      title: "SpyFu usage this month",
+      description:
+        "Rows the plugin has bought from SpyFu this month, the monthly row ceiling, rows left, and the " +
+        "rate per 1,000 rows for each lookup. Free: it does not call SpyFu. Check it before a run of " +
+        "several lookups. No parameters.",
+      inputSchema: {},
+    },
+    async () => result(await wpGet("/spyfu/usage"))
+  );
+
+  server.registerTool(
+    "spyfu_domain_overview",
+    {
+      title: "SpyFu domain overview",
+      description:
+        "One domain's latest SpyFu snapshot: organic keyword count, estimated organic clicks and their " +
+        "value, paid keyword count, estimated monthly ad budget and paid clicks, and domain strength. " +
+        "Costs 1 row. Use it first to see whether SpyFu knows a domain at all before buying larger lookups." +
+        SPYFU_SPEND_DESC,
+      inputSchema: { domain: SPYFU_DOMAIN },
+    },
+    async ({ domain }) => result(await wpGet("/spyfu/domain-overview", { domain }))
+  );
+
+  server.registerTool(
+    "spyfu_domain_keywords",
+    {
+      title: "SpyFu organic keywords for a domain",
+      description:
+        "The organic keywords a domain ranks for, with position, ranking URL, search volume, keyword " +
+        "difficulty, estimated organic clicks and cost per click. This is the organic side, for SEO " +
+        "questions. For what a domain pays for, use spyfu_competitor_paid_keywords." + SPYFU_SPEND_DESC,
+      inputSchema: {
+        domain: SPYFU_DOMAIN,
+        limit: spyfuLimit(25),
+        sort: z.enum(["clicks", "volume"]).default("clicks")
+          .describe("clicks (default) ranks by the organic clicks the domain gets from each keyword. volume ranks by search volume."),
+      },
+    },
+    async ({ domain, limit, sort }) => result(await wpGet("/spyfu/domain-keywords", { domain, limit, sort }))
+  );
+
+  server.registerTool(
+    "spyfu_keyword_stats",
+    {
+      title: "SpyFu keyword stats",
+      description:
+        "Search volume, ranking difficulty, cost per click by match type, estimated monthly cost and " +
+        "number of advertisers for a list of exact keywords. One row per keyword that SpyFu knows; " +
+        "keywords it has no data for come back under no_data and cost nothing." + SPYFU_SPEND_DESC,
+      inputSchema: {
+        keywords: z.array(z.string().min(1)).min(1).max(50)
+          .describe("Exact keywords, no brackets or quotes. Max 50 per call."),
+      },
+    },
+    async ({ keywords }) => result(await wpGet("/spyfu/keyword-stats", { keywords: keywords.join(",") }))
+  );
+
+  server.registerTool(
+    "spyfu_competitors",
+    {
+      title: "SpyFu top competitors",
+      description:
+        "Who competes with a domain, by keyword overlap. type paid (default) lists domains bidding on the " +
+        "same keywords; type organic lists domains ranking for the same keywords. Each row is marked " +
+        "approved true or false against the saved approved list. SpyFu's list mixes real rivals with " +
+        "directories, software firms and job boards, so ALWAYS show the names to the user and let them " +
+        "strike any before saving the list with set_approved_competitors or building anything on it." +
+        SPYFU_SPEND_DESC,
+      inputSchema: {
+        domain: z.string().optional()
+          .describe("Domain to find competitors for. Leave out to use TSN's own domain from the plugin settings."),
+        type: z.enum(["paid", "organic"]).default("paid")
+          .describe("paid (default) for Google Ads competitors, organic for search ranking competitors."),
+        limit: spyfuLimit(10),
+      },
+    },
+    async ({ domain, type, limit }) =>
+      result(await wpGet("/spyfu/competitors", { domain, type: type === "organic" ? "seo" : "ppc", limit }))
+  );
+
+  server.registerTool(
+    "spyfu_ad_history",
+    {
+      title: "SpyFu competitor ad copy",
+      description:
+        "A domain's best-performing Google ad copy: headline, body, display URL, the keyword it ran on " +
+        "and when it was last seen. Identical ads on several keywords are merged, with the other keywords " +
+        "under also_on. This is the most expensive lookup per row, so keep the limit modest. Treat the " +
+        "copy as raw material: write new ads for TSN, never reuse competitor wording or brand names, and " +
+        "push new ads with create_rsa (always PAUSED) only after the user has read them." + SPYFU_SPEND_DESC,
+      inputSchema: { domain: SPYFU_DOMAIN, limit: spyfuLimit(25) },
+    },
+    async ({ domain, limit }) => result(await wpGet("/spyfu/ad-history", { domain, limit }))
+  );
+
+  server.registerTool(
+    "spyfu_competitor_paid_keywords",
+    {
+      title: "SpyFu competitor paid keywords",
+      description:
+        "The paid keywords SpyFu rates most successful for a domain over the past year, with search " +
+        "volume, cost per click by match type, estimated monthly cost and number of advertisers. Before " +
+        "recommending any, check them against get_search_terms and the campaign's existing keywords and " +
+        "negatives, and recommend only the few that fit a live campaign and its landing page. Add " +
+        "approved ones with manage_keywords (dry run first)." + SPYFU_SPEND_DESC,
+      inputSchema: { domain: SPYFU_DOMAIN, limit: spyfuLimit(25) },
+    },
+    async ({ domain, limit }) => result(await wpGet("/spyfu/paid-keywords", { domain, limit }))
+  );
+
+  server.registerTool(
+    "spyfu_keyword_gap",
+    {
+      title: "SpyFu paid keyword gap",
+      description:
+        "Paid keywords that competitors buy and TSN does not. Leave competitors out to use the saved " +
+        "approved list. With all_must_buy false (default) a keyword qualifies if any listed competitor " +
+        "buys it; true keeps only keywords every listed competitor buys, a much shorter and stronger " +
+        "list. Most results will not fit: recommend only those matching a live campaign and landing page." +
+        SPYFU_SPEND_DESC,
+      inputSchema: {
+        competitors: z.array(z.string().min(3)).max(5).optional()
+          .describe("Up to 5 competitor domains. Leave out to use the approved competitor list."),
+        all_must_buy: z.boolean().default(false)
+          .describe("false (default): any listed competitor buys the keyword. true: every listed competitor buys it."),
+        limit: spyfuLimit(25),
+      },
+    },
+    async ({ competitors, all_must_buy, limit }) =>
+      result(await wpGet("/spyfu/keyword-gap", {
+        competitors: (competitors || []).join(","),
+        all: all_must_buy ? "1" : "",
+        limit,
+      }))
+  );
+
+  server.registerTool(
+    "get_approved_competitors",
+    {
+      title: "Approved competitor list",
+      description:
+        "Read the approved competitor list saved in the plugin, and TSN's own domain. The monthly " +
+        "competitor pass reads the first five on it, and spyfu_keyword_gap uses it by default. Free: it " +
+        "does not call SpyFu. An empty list means nothing has been approved yet. No parameters.",
+      inputSchema: {},
+    },
+    async () => result(await wpGet("/competitors/list"))
   );
 
   // =========================================================================
@@ -537,6 +716,26 @@ function buildServer() {
               : "No undo was recorded for this change (applied before plugin v115.9, or not reversible here). Reverse it in Google Ads."),
       });
     }
+  );
+
+  server.registerTool(
+    "set_approved_competitors",
+    {
+      title: "Save the approved competitor list",
+      description:
+        "Replace the approved competitor list with the domains given. This is a WordPress setting, not a " +
+        "Google Ads change, and it costs no SpyFu rows. Send the COMPLETE list every time: anything left " +
+        "out is removed. Up to 10 domains; the monthly competitor pass reads the first five, so put the " +
+        "most important first. An empty list clears it, and the monthly pass goes back to letting SpyFu " +
+        "pick. Only save names the user has seen and agreed to. ALWAYS run once with dry_run true, show " +
+        "the user what is added and removed, and only then re-run with dry_run false.",
+      inputSchema: {
+        domains: z.array(z.string()).max(10)
+          .describe("The complete approved list, most important first. Root domains such as example.com."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ domains, dry_run }) => result(await wpPost("/competitors/list", { domains, dry_run }))
   );
 
   server.registerTool(
