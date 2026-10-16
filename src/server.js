@@ -51,6 +51,14 @@
 // recorded as an applied change, so list_recent_changes shows it and
 // undo_change reverses it.
 //
+// server 1.8.0 (plugin v116.3.0+): adds list_open_findings and apply_finding,
+// reading the plugin's /proposals/open and /proposals/{id}/apply routes. They
+// let Claude read what the daily digest proposed, in full, and apply one item
+// the owner has said yes to in chat, through the same dispatcher as the
+// review page (kill switch, caps and undo included). Landing page findings are
+// written to the site through Site Bridge first; apply_finding then checks the
+// live page and closes them. Dry run first, as always.
+//
 // server 1.7.0 (plugin v116.1.0+): adds ten tools, reading the plugin's
 // /spyfu/* routes and /competitors/list. Eight are read-only SpyFu lookups
 // (usage, domain overview, organic keywords, keyword stats, competitors, ad
@@ -166,7 +174,7 @@ const spyfuLimit = (dflt) => z.number().int().min(1).max(100).default(dflt)
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.7.0",
+    version: "1.8.0",
   });
 
   // =========================================================================
@@ -736,6 +744,67 @@ function buildServer() {
       },
     },
     async ({ domains, dry_run }) => result(await wpPost("/competitors/list", { domains, dry_run }))
+  );
+
+  server.registerTool(
+    "list_open_findings",
+    {
+      title: "Open digest findings",
+      description:
+        "List what the daily digest has proposed and is still waiting on a decision, in full: the id, type, " +
+        "campaign, label, why, evidence and the complete payload (for a landing_page finding that is the page URL, " +
+        "the keywords it must repeat, what the page says now, and every drafted field; for rsa_copy, every headline " +
+        "and description). apply_does says what applying it would do. Use type to narrow the list, e.g. landing_page. " +
+        "To act on a landing_page finding: show the user the drafted wording, write it with the site's Site Bridge " +
+        "connector (update_landing_page for a rewrite, create_landing_page then publish_content for a new page, each " +
+        "dry run first), then call apply_finding on it so the plugin checks the live page and closes it.",
+      inputSchema: {
+        type: z.enum(["landing_page", "rsa_copy", "ad_group", "bid_ceiling", "budget", "keyword_add", "keyword_pause",
+          "negative_keyword", "geo_exclude", "campaign_setting", "campaign_draft", "conversion_goal"]).optional()
+          .describe("Only this kind of finding. Omit for all."),
+        id: z.number().int().min(1).optional().describe("One finding by id (the # shown in the digest email)."),
+      },
+    },
+    async ({ type, id }) => result(await wpGet("/proposals/open", { type: type || "", id: id || 0 }))
+  );
+
+  server.registerTool(
+    "apply_finding",
+    {
+      title: "Apply one digest finding",
+      description:
+        "Apply one open digest finding by id, the same way ticking it on the review page does: through the plugin's " +
+        "dispatcher, with its kill switch, spend caps and monthly ceiling, and with an undo recorded where the change " +
+        "can be reversed (see list_recent_changes and undo_change). For a landing_page finding nothing is written to " +
+        "the site: the plugin reads the live page and closes the finding only if it carries the approved wording; a " +
+        "new page also gets a PAUSED copy of the ad group's ad pointing at it. Write the page with Site Bridge first. " +
+        "Set skip_page_check only when the site's security blocks the plugin's check and you have just confirmed the " +
+        "page yourself. " + CAPS_DESC + " " +
+        "ALWAYS run once with dry_run true, show the user the plan, and only then re-run with dry_run false.",
+      inputSchema: {
+        id: z.number().int().min(1).describe("Finding id from list_open_findings."),
+        skip_page_check: z.boolean().default(false)
+          .describe("landing_page only: close it without the plugin reading the page. Only after you have verified the live page."),
+        dry_run: z.boolean().default(true).describe(DRY_RUN_DESC),
+      },
+    },
+    async ({ id, skip_page_check, dry_run }) => {
+      if (!dry_run) return result(await wpPost(`/proposals/${id}/apply`, { skip_page_check }));
+      const open = await wpGet("/proposals/open", { id });
+      if (open.ok === false) return result(open);
+      const row = (open.proposals || [])[0];
+      if (!row) {
+        return result({ ok: false, dry_run: true, id,
+          error: "No open finding with that id. It may already be applied or skipped; check list_recent_changes." });
+      }
+      return result({
+        ok: row.applicable, dry_run: true, id, type: row.type, change: row.label, why: row.why,
+        would_do: row.apply_does,
+        note: row.applicable
+          ? "Nothing has been changed. Re-run with dry_run false to apply."
+          : "This kind of finding is reviewed, not applied from here.",
+      });
+    }
   );
 
   server.registerTool(
