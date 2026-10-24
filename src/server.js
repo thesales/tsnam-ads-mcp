@@ -59,6 +59,12 @@
 // written to the site through Site Bridge first; apply_finding then checks the
 // live page and closes them. Dry run first, as always.
 //
+// server 1.9.0 (plugin v116.4.0+): adds get_asset_performance, reading the
+// plugin's /assets/performance route. Headline CTR per ad group, ranked in the
+// plugin's code (winners, the weakest live headlines, and which headline
+// features lift CTR per campaign). Read-only, no model call, no Google change.
+// New copy written from it still goes through create_rsa, always PAUSED.
+//
 // server 1.7.0 (plugin v116.1.0+): adds ten tools, reading the plugin's
 // /spyfu/* routes and /competitors/list. Eight are read-only SpyFu lookups
 // (usage, domain overview, organic keywords, keyword stats, competitors, ad
@@ -174,7 +180,7 @@ const spyfuLimit = (dflt) => z.number().int().min(1).max(100).default(dflt)
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.8.0",
+    version: "1.9.0",
   });
 
   // =========================================================================
@@ -272,6 +278,30 @@ function buildServer() {
       },
     },
     async ({ query }) => result(await wpGet("/gaql", { q: query }))
+  );
+
+  server.registerTool(
+    "get_asset_performance",
+    {
+      title: "Headline performance by ad group",
+      description:
+        "Every live ad group's headlines ranked by their own click-through rate, combined across ads by text. " +
+        "The ranking and the arithmetic are done in the plugin's code: a headline needs a minimum of impressions " +
+        "before it counts, winners are the top CTRs inside the ad group, losers are live headlines well below the " +
+        "ad group's CTR. Per campaign, features (free, outcome, audience named, TSN name, question, speed, number, " +
+        "AI term, credential) are reported with CTR with and without them, only where both sides have enough data. " +
+        "Google's own performance label is not used (it reads NOT_APPLICABLE at this account's volume). " +
+        "Read-only. To act on it: draft replacements for the losers from what the winners and features show, show " +
+        "the user every headline, then create_rsa with the live ad's headlines swapped (it lands PAUSED). " +
+        "The same analysis runs itself on the 1st and 15th and puts its rewrites on the review page.",
+      inputSchema: {
+        days: z.number().int().min(14).max(365).default(90)
+          .describe("Window in days, 14-365. Default 90; shorter windows leave most headlines below the minimum."),
+        campaign_id: z.string().optional()
+          .describe("Optional numeric campaign ID to narrow the report. Omit for every enabled Search campaign."),
+      },
+    },
+    async ({ days, campaign_id }) => result(await wpGet("/assets/performance", { days, campaign_id }))
   );
 
   // =========================================================================
