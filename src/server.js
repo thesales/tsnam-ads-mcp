@@ -887,7 +887,7 @@ if (AUTH_MODE === "path") {
   });
 } else {
   // Default: bearer-token in the Authorization header on POST /mcp
-  // Use this mode for MCP Inspector, Claude Desktop, and the Claude API.
+  // Use this mode for MCP Inspector, Claude Desktop, and the Claude API.  
   app.post("/mcp", async (req, res) => {
     const auth = req.get("authorization") || "";
     const m = auth.match(/Bearer\s+(.+)/i);
