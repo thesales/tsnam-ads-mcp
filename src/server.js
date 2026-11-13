@@ -1,5 +1,5 @@
 // =============================================================================
-// TSN Ads Manager, MCP Server
+// TSN Ads Manager, MCP Server - v1_10_0
 // =============================================================================
 // Exposes your live Google Ads data (via the TSN Ads Manager WordPress plugin's
 // REST API) as MCP tools that Claude can call in conversation.
@@ -58,6 +58,10 @@
 // review page (kill switch, caps and undo included). Landing page findings are
 // written to the site through Site Bridge first; apply_finding then checks the
 // live page and closes them. Dry run first, as always.
+//
+// server 1.10.0 (plugin v116.5.0+): adds get_change_watch, run_change_watch and
+// suggest_negatives, reading the plugin's /change-watch and /negatives/suggest
+// routes. None of them changes the Google Ads account.
 //
 // server 1.9.0 (plugin v116.4.0+): adds get_asset_performance, reading the
 // plugin's /assets/performance route. Headline CTR per ad group, ranked in the
@@ -180,7 +184,7 @@ const spyfuLimit = (dflt) => z.number().int().min(1).max(100).default(dflt)
 function buildServer() {
   const server = new McpServer({
     name: "tsn-ads-manager",
-    version: "1.9.0",
+    version: "1.10.0",
   });
 
   // =========================================================================
@@ -838,6 +842,45 @@ function buildServer() {
   );
 
   server.registerTool(
+    "get_change_watch",
+    {
+      title: "Change watch status",
+      description:
+        "Read the hourly account watch: when it last checked, whether it is failing, the approved emails, known users, " +
+        "active manager accounts and recent alerts. Read-only. No parameters.",
+      inputSchema: {},
+    },
+    async () => result(await wpGet("/change-watch"))
+  );
+
+  server.registerTool(
+    "run_change_watch",
+    {
+      title: "Run the change watch now",
+      description:
+        "Run one account check immediately. It reads Google Ads and emails the owner if something needs attention. " +
+        "It never changes the account. No parameters.",
+      inputSchema: {},
+    },
+    async () => result(await wpPost("/change-watch/run", {}))
+  );
+
+  server.registerTool(
+    "suggest_negatives",
+    {
+      title: "Suggest negative keywords",
+      description:
+        "Add negative keyword suggestions to the digest review page: other forms of existing short negatives (variants), " +
+        "competitor brand names (competitors), or both. Suggestions that would block a live keyword are refused in code. " +
+        "Nothing reaches the account until the owner ticks it. The competitor pass buys SpyFu rows and uses web search, so run it sparingly.",
+      inputSchema: {
+        kind: z.enum(["variants", "competitors", "both"]).default("variants").describe("Which pass to run."),
+      },
+    },
+    async ({ kind }) => result(await wpPost("/negatives/suggest", { kind }))
+  );
+
+  server.registerTool(
     "run_optimizer",
     {
       title: "Run the optimizer",
@@ -887,7 +930,7 @@ if (AUTH_MODE === "path") {
   });
 } else {
   // Default: bearer-token in the Authorization header on POST /mcp
-  // Use this mode for MCP Inspector, Claude Desktop, and the Claude API.  
+  // Use this mode for MCP Inspector, Claude Desktop, and the Claude API.
   app.post("/mcp", async (req, res) => {
     const auth = req.get("authorization") || "";
     const m = auth.match(/Bearer\s+(.+)/i);
