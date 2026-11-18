@@ -42,3 +42,14 @@ jobs:
             org.opencontainers.image.source=https://github.com/thesales/tsnam-ads-mcp
             org.opencontainers.image.title=TSN Ads MCP Server
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+
+      - name: Smoke test the published image
+        run: |
+          docker run -d --name mcp -e MCP_SECRET=smoke -e TSNAM_API_BASE=https://example.invalid -e TSNAM_API_TOKEN=x -p 8787:8787 ghcr.io/thesales/tsnam-ads-mcp:latest
+          for i in $(seq 1 20); do curl -sf localhost:8787/ && break; sleep 1; done
+          echo
+          n=$(curl -sf -X POST localhost:8787/mcp/smoke -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))")
+          echo "tools: $n"; test "$n" -gt 0
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8787/mcp/wrong -H 'content-type: application/json' -d '{}')
+          test "$code" = "404" && echo "wrong secret refused: $code"
