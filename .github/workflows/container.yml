@@ -1,0 +1,44 @@
+# Builds the server into a container image on every push to main and publishes
+# it to GitHub Container Registry as ghcr.io/thesales/tsnam-ads-mcp:latest.
+# gz-server (Unraid) pulls that image. Render keeps deploying from main until
+# it is switched off, so both can run side by side during the move.
+name: Build container
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read server version from src/server.js
+        id: ver
+        run: |
+          v=$(grep -m1 -oE 'v[0-9]+[._][0-9]+[._][0-9]+' src/server.js | tr '_' '.')
+          echo "version=${v:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/thesales/tsnam-ads-mcp:latest
+            ghcr.io/thesales/tsnam-ads-mcp:${{ steps.ver.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/thesales/tsnam-ads-mcp
+            org.opencontainers.image.title=TSN Ads MCP Server
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
